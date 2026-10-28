@@ -1,11 +1,13 @@
-"""Binary black hole waveform classes (frequency-domain SNR waveforms and PhenomTHM TDI waveforms)."""
+"""Binary black hole waveform classes (frequency-domain SNR waveforms, PhenomTHM and SEOBNRv5PHM TDI waveforms)."""
 
 from __future__ import annotations
 
+import importlib.util
 from copy import deepcopy
 from typing import Any, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 from bbhx.waveformbuild import BBHWaveformFD
 
 # stft_tof merge: fastlisaresponse is retired -- ResponseWrapper lives in
@@ -26,6 +28,13 @@ try:
 except (ImportError, ModuleNotFoundError):
     phentax_available = False
     jnp = np  # type: ignore
+
+# pyseobnr_x is imported lazily in :class:`SEOBNRWaveformBase` (its import is slow).
+pyseobnr_available = importlib.util.find_spec("pyseobnr_x") is not None
+
+if pyseobnr_available:
+    from pyseobnr_x import generate_waveform as seob_generate_waveform
+    from pyseobnr_x.eob.utils.batch_containers import RaggedBatch
 
 if TYPE_CHECKING:
     try:
@@ -132,7 +141,75 @@ class BBHSNRWaveform(SNRWaveform):
         else:
             return (AET[0], AET[1], AET[2])
 
-class PhenomTHMWaveformBase(JaxBase):
+class BBHTDWaveformMixin:
+    """
+    Waveform-agnostic helpers for batched time-domain BBH polarizations, shared by :class:`PhenomTHMWaveformBase` and :class:`SEOBNRWaveformBase`.
+
+    Both expect the batch on a common time grid, with each source zero-padded before its start and a mask flagging the samples from the start of each source onwards.
+    """
+
+    @staticmethod
+    def trim_and_shift_times(
+        times: NDArrayLike,
+        mask: NDArrayLike,
+        *,
+        xp: ArrayModule,
+        dt: float,
+    ) -> NDArrayLike:
+        """
+        Shift and trim the time arrays for each source according to its mask, so that the resulting time arrays have the same shape (Nbatch, max_valid_times). the initial time points can be different across sources.
+
+        Args:
+            times (Array): Time arrays for each source, shape (Nbatch, Ntimes).
+            mask (Array): Boolean mask indicating valid time samples for each source, shape (Nbatch, Ntimes).
+            xp: Array module (numpy or cupy).
+            dt: Time step in seconds.
+
+        Returns:
+            Shifted time arrays, shape (Nbatch, max_valid_times).
+        """
+        valid_points = mask.sum(axis=1)
+        max_valid_points = int(valid_points.max())
+
+        times_out = times[:, -max_valid_points:]
+
+        n_pad = max_valid_points - valid_points  # (Nbatch,)
+
+        j = xp.arange(max_valid_points)  # (max_valid_points,)
+
+        is_invalid = j[None, :] < n_pad[:, None]  # (Nbatch, max_valid_points)
+
+        batch_idx = xp.arange(times_out.shape[0])
+        first_valid_time = times_out[batch_idx, n_pad]  # (Nbatch,)
+
+        replacement_times = first_valid_time[:, None] - (n_pad[:, None] - j[None, :]) * dt
+
+        times_out = xp.where(is_invalid, replacement_times, times_out)
+
+        return times_out  # shape (Nbatch, max_valid_points)
+
+    @staticmethod
+    def _leading_onset_ramp(num_points: int, num_pad: int, taper_length: int, xp: ArrayModule) -> NDArrayLike:
+        """
+        Get a leading onset ramp to smoothly turn on the waveform.
+        This avoids the sharp jump from zero to the first valid point.
+
+        Args:
+            num_points: Total number of points in the output array.
+            num_pad: Number of initial points that are invalid.
+            taper_length: Length of the taper in number of points.
+            xp: Array module (numpy or cupy).
+
+        Returns:
+            Ramp array of shape (num_points,).
+        """
+        rj = xp.arange(num_points)
+        offset = rj[None, :] - xp.asarray(num_pad, dtype=int)[:, None]
+        x = xp.clip(offset / float(taper_length), 0.0, 1.0)
+        return 0.5 * (1.0 - xp.cos(xp.pi * x))
+
+
+class PhenomTHMWaveformBase(JaxBase, BBHTDWaveformMixin):
     """
     Base class for PhenomTHM waveforms.
 
@@ -189,67 +266,6 @@ class PhenomTHMWaveformBase(JaxBase):
             "use_reference_time": self.use_reference_time,
             "use_coalescence_time": self.ref_time is not None,
             }
-        
-    
-    @staticmethod
-    def trim_and_shift_times(
-        times: NDArrayLike,
-        mask: NDArrayLike,
-        *,
-        xp: ArrayModule,
-        dt: float,
-    ) -> NDArrayLike:
-        """
-        Shift and trim the time arrays for each source according to its mask, so that the resulting time arrays have the same shape (Nbatch, max_valid_times). the initial time points can be different across sources.
-
-        Args:
-            times (Array): Time arrays for each source, shape (Nbatch, Ntimes).
-            mask (Array): Boolean mask indicating valid time samples for each source, shape (Nbatch, Ntimes).
-            xp: Array module (numpy or cupy).
-            dt: Time step in seconds.
-
-        Returns:
-            Shifted time arrays, shape (Nbatch, max_valid_times).
-        """
-        valid_points = mask.sum(axis=1)
-        max_valid_points = int(valid_points.max())
-
-        times_out = times[:, -max_valid_points:]
-
-        n_pad = max_valid_points - valid_points  # (Nbatch,)
-
-        j = xp.arange(max_valid_points)  # (max_valid_points,)
-
-        is_invalid = j[None, :] < n_pad[:, None]  # (Nbatch, max_valid_points)
-
-        batch_idx = xp.arange(times_out.shape[0])
-        first_valid_time = times_out[batch_idx, n_pad]  # (Nbatch,)
-
-        replacement_times = first_valid_time[:, None] - (n_pad[:, None] - j[None, :]) * dt
-
-        times_out = xp.where(is_invalid, replacement_times, times_out)
-
-        return times_out  # shape (Nbatch, max_valid_points)
-    
-    @staticmethod
-    def _leading_onset_ramp(num_points: int, num_pad: int, taper_length: int, xp: ArrayModule) -> NDArrayLike:
-        """
-        Get a leading onset ramp to smoothly turn on the waveform.
-        This avoids the sharp jump from zero to the first valid point.
-
-        Args:
-            num_points: Total number of points in the output array.
-            num_pad: Number of initial points that are invalid.
-            taper_length: Length of the taper in number of points.
-            xp: Array module (numpy or cupy).
-
-        Returns:
-            Ramp array of shape (num_points,).
-        """
-        rj = xp.arange(num_points)
-        offset = rj[None, :] - xp.asarray(num_pad, dtype=int)[:, None]
-        x = xp.clip(offset / float(taper_length), 0.0, 1.0)
-        return 0.5 * (1.0 - xp.cos(xp.pi * x))
 
     def get_reference_quantities(self,
                                 merger_time: float | NDArrayLike, 
@@ -623,3 +639,369 @@ class PhenomTHMTDIOnFlyWaveform(TDTDIOnFlyWaveformBase, PhenomTHMWaveformBase):
         """
 
         return (amp / 2.0, self.xp.pi - phase)
+
+class SEOBNRWaveformBase(BBHTDWaveformMixin):
+    """
+    Base class for SEOBNRv5PHM waveforms generated with ``pyseobnr_x``.
+
+    This class is not meant to be used directly, but it contains the common code for :class:`SEOBNRTDIWaveform`.
+    It mirrors :class:`PhenomTHMWaveformBase`: the batch of binaries is evaluated in a single ``pyseobnr_x``
+    call, and the polarizations of every binary are retrieved in a single kernel call on a common time grid
+    with spacing ``self.dt`` and :math:`t=0` at the peak of the co-precessing (2,2) amplitude (``LISA`` context).
+
+    Args:
+        waveform_kwargs: Computation parameters forwarded to :class:`pyseobnr_x.generate_waveform.GenerateWaveform`
+            (e.g. ``ModeArray``, ``postadiabatic``, ``ode_backend``, ``frame``...). They override the defaults
+            (``context="LISA"`` plus the CPU or GPU switches, chosen from ``force_backend``).
+        Tobs: Maximum length of the waveform in seconds. Longer waveforms are cut at the start.
+        start_freq: Starting frequency of the (2,2) mode in Hz. If `None`, it has to be explicitly provided in the waveform generation calls.
+        ref_freq: Reference frequency in Hz. If `None`, it defaults to the starting frequency.
+    """
+
+    CPU_SWITCHES = dict(
+        ode_backend="boost",
+        pn_ode_backend="boost",
+        hamiltonian="generated",
+        rholm="generated",
+        frame="cpp",
+        inspiral_modes="cpp",
+        antisymmetric_stage="cpp",
+    )
+
+    GPU_SWITCHES = dict(
+        CPU_SWITCHES,
+        frame="cuda",
+        inspiral_modes="cuda",
+        antisymmetric_stage="cuda",
+    )
+
+    def __init__(
+        self,
+        waveform_kwargs: dict,
+        Tobs: float,
+        start_freq: float = None,
+        ref_freq: float = None,
+    ) -> None:
+
+        if not pyseobnr_available:
+            raise ImportError(
+                "SEOBNRv5PHM is not available. Please install pyseobnr_x to use this waveform."
+            )
+
+        self._seob = seob_generate_waveform
+        self._RaggedBatch = RaggedBatch
+
+        use_gpu = self.force_backend is not None and self.force_backend != "cpu"
+        switches = self.GPU_SWITCHES if use_gpu else self.CPU_SWITCHES
+
+        self.waveform_kwargs = dict(waveform_kwargs)
+        self.computation_parameters = {"context": "LISA", **switches, **self.waveform_kwargs}
+
+        self.T_obs = Tobs
+        self.start_freq = start_freq
+        self.ref_freq = ref_freq
+
+    @property
+    def seob_kwargs(self) -> dict:
+        """Dictionary of SEOBNR settings used to initialize the waveform, for reproducibility and debugging."""
+
+        return {
+            "waveform_kwargs": self.waveform_kwargs,
+            "Tobs": self.T_obs,
+            "start_freq": self.start_freq,
+            "ref_freq": self.ref_freq,
+        }
+
+    def compute_polarizations_at_once(
+        self,
+        m1: NDArrayLike,
+        m2: NDArrayLike,
+        s1z: NDArrayLike,
+        s2z: NDArrayLike,
+        distance: NDArrayLike,
+        phi_ref: NDArrayLike,
+        inclination: NDArrayLike,
+        psi: NDArrayLike,
+        start_freq: float | NDArrayLike = None,
+        ref_freq: float | NDArrayLike = None,
+    ) -> Tuple[NDArrayLike, NDArrayLike, NDArrayLike, NDArrayLike]:
+        """
+        Generate the polarizations of a batch of sources on a common time grid.
+
+        Same output layout as :meth:`phentax.waveform.IMRPhenomTHM.compute_polarizations_at_once`: each source is
+        zero outside of its own valid time range, and ``mask`` flags the samples from the start of each waveform
+        to the end of the grid (so that the valid samples are right-aligned, as :meth:`trim_and_shift_times` expects).
+
+        Args:
+            m1: Source-1 masses in solar masses, shape (Nbatch,).
+            m2: Source-2 masses in solar masses, shape (Nbatch,).
+            s1z: Dimensionless spin of source 1, shape (Nbatch,).
+            s2z: Dimensionless spin of source 2, shape (Nbatch,).
+            distance: Luminosity distance in Mpc, shape (Nbatch,).
+            phi_ref: Reference phase in radians, shape (Nbatch,).
+            inclination: Inclination angle in radians, shape (Nbatch,).
+            psi: Polarisation angle in radians, shape (Nbatch,).
+            start_freq: Starting frequency in Hz. If `None`, it will default to `self.start_freq`.
+            ref_freq: Reference frequency in Hz. If `None`, it will default to `self.ref_freq`, then to the starting frequency.
+
+        Returns:
+            times (Ntimes,), mask (Nbatch, Ntimes), h_plus (Nbatch, Ntimes), h_cross (Nbatch, Ntimes), on ``self.xp``.
+        """
+
+        start_freq = start_freq if start_freq is not None else self.start_freq
+        ref_freq = ref_freq if ref_freq is not None else self.ref_freq
+        if start_freq is None:
+            raise ValueError("start_freq has to be provided, either at initialization or in the call.")
+        if ref_freq is None:
+            ref_freq = start_freq
+
+        # pyseobnr_x works on the host
+        to_host = lambda a: np.atleast_1d(a.get() if hasattr(a, "get") else np.asarray(a)).astype(np.float64)
+        m1, m2, s1z, s2z, distance, phi_ref, inclination, psi = (
+            to_host(arg) for arg in (m1, m2, s1z, s2z, distance, phi_ref, inclination, psi)
+        )
+        num_bin = m1.shape[0]
+
+        binaries = pd.DataFrame(
+            dict(
+                mass1=m1,
+                mass2=m2,
+                spin1z=s1z,
+                spin2z=s2z,
+                distance=distance,
+                phi_ref=phi_ref,
+                inclination=inclination,
+                f22_start=np.broadcast_to(to_host(start_freq), (num_bin,)),
+                f_ref=np.broadcast_to(to_host(ref_freq), (num_bin,)),
+                deltaT=self.dt,
+            )
+        )
+
+        generator = self._seob.GenerateWaveform(binaries, self.computation_parameters)
+        generator.evaluate_model()
+        model = generator.model
+
+        if not model.evaluated.all():
+            failed = np.flatnonzero(~model.evaluated)
+            raise RuntimeError(
+                f"SEOBNRv5PHM evaluation failed for sources {failed.tolist()}: "
+                f"{ {int(i): str(model.errors.get(i)) for i in failed} }"
+            )
+
+        # valid range of each waveform, with t=0 at the (2,2) amplitude peak
+        output = model.batch_output
+        mtot = np.array([p["mass1"] + p["mass2"] for p in generator.parameters_list])
+        dist = np.array([p["distance"] for p in generator.parameters_list])
+        mtot_sec = mtot * self._seob.lal.MTSUN_SI
+
+        t_shift = np.asarray(output.t_shift[:num_bin])
+        t_lo_geo = np.asarray(output.t_start[:num_bin]) - t_shift
+        t_hi_geo = np.asarray(output.t_duration[:num_bin]) - t_shift
+
+        t_hi = t_hi_geo * mtot_sec
+        t_lo = np.maximum(t_lo_geo * mtot_sec, t_hi - self.T_obs)
+
+        # common grid on integer multiples of dt, so the merger sits on the grid
+        k_lo = int(np.ceil(t_lo.min() / self.dt))
+        k_hi = int(np.floor(t_hi.max() / self.dt))
+        times = np.arange(k_lo, k_hi + 1) * self.dt
+
+        # per-source geometric time samples, retrieved in one kernel call
+        sel = (times[None, :] >= t_lo[:, None]) & (times[None, :] <= t_hi[:, None])
+        times_geo = times[None, :] / mtot_sec[:, None]
+        sel &= (times_geo >= t_lo_geo[:, None]) & (times_geo <= t_hi_geo[:, None])
+
+        counts = sel.sum(axis=1)
+        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+        rows = model.polarizations.evaluate(
+            self._RaggedBatch(values=np.ascontiguousarray(times_geo[sel]), offsets=offsets),
+            np.arange(num_bin, dtype=np.intp),
+            time_shift=t_shift,
+        )
+
+        # h+ - i hx, with the distance and LAL sign convention of GenerateWaveform
+        fac = -mtot * self._seob.lal.MRSUN_SI / (dist * self._seob.Mpc_to_meters)
+        hpc = np.zeros(sel.shape, dtype=np.complex128)
+        hpc[sel] = rows * np.repeat(fac, counts)
+
+        # rotate by the polarization angle, as phentax does
+        cos_2psi = np.cos(2.0 * psi)[:, None]
+        sin_2psi = np.sin(2.0 * psi)[:, None]
+        hplus = hpc.real * cos_2psi + hpc.imag * sin_2psi
+        hcross = hpc.real * sin_2psi - hpc.imag * cos_2psi
+
+        mask = times[None, :] >= times[sel.argmax(axis=1)][:, None]
+
+        return (
+            self.xp.asarray(times),
+            self.xp.asarray(mask),
+            self.xp.asarray(hplus),
+            self.xp.asarray(hcross),
+        )
+
+
+class SEOBNRTDIWaveform(TDPyResponseWaveformBase, SEOBNRWaveformBase):
+    """
+    Generate SEOBNRv5PHM waveforms with the TDI LISA Response.
+
+    Drop-in replacement for :class:`PhenomTHMTDIWaveform` (same parameters, same outputs), with aligned spins.
+
+    Args:
+        waveform_kwargs: Computation parameters forwarded to :class:`pyseobnr_x.generate_waveform.GenerateWaveform`.
+        Tobs: Maximum length of the waveform in seconds.
+        start_freq: Starting frequency in Hz for the waveform generation. If `None`, it has to be explicitly provided in the waveform generation calls.
+        ref_freq: Reference frequency in Hz for the waveform generation. If `None`, it defaults to the starting frequency.
+        *args: Additional positional arguments forwarded to :class:`TDPyResponseWaveformBase`.
+        **kwargs: Additional keyword arguments forwarded to :class:`TDPyResponseWaveformBase`.
+    """
+
+    def __init__(
+        self,
+        waveform_kwargs: dict,
+        Tobs: float = 1.0,
+        start_freq: float = None,
+        ref_freq: float = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+
+        TDPyResponseWaveformBase.__init__(
+            self,
+            *args,
+            **kwargs,
+        )
+
+        SEOBNRWaveformBase.__init__(
+            self,
+            waveform_kwargs=waveform_kwargs,
+            Tobs=Tobs,
+            start_freq=start_freq,
+            ref_freq=ref_freq,
+        )
+
+    @property
+    def kwargs(self) -> dict:
+        """Dictionary of waveform settings used to initialize the waveform, for reproducibility and debugging."""
+
+        seob_kwargs = self.seob_kwargs  # get the SEOBNR-specific kwargs
+        wrapper_kwargs = self.wrapper_kwargs # get the TD TDI wrapper-specific kwargs
+
+        return {
+            **seob_kwargs,
+            **wrapper_kwargs,
+        }
+
+    def wave_gen(
+        self,
+        m1: float,
+        m2: float,
+        s1z: float,
+        s2z: float,
+        distance: float,
+        phi_ref: float,
+        inclination: float,
+        psi: float,
+        ra: float = None,
+        dec: float = None,
+        merger_time: float = None,
+        ref_freq: float = None,
+        start_freq: float = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Generate the waveform's polarizations for a single source.
+
+        Args:
+            m1: Source-1 mass in solar masses.
+            m2: Source-2 mass in solar masses.
+            s1z: Dimensionless spin of source 1.
+            s2z: Dimensionless spin of source 2.
+            distance: Luminosity distance in Mpc.
+            phi_ref: Reference phase in radians.
+            inclination: Inclination angle in radians.
+            psi: Polarisation angle in radians.
+            ra: Right ascension for the source in radians.
+            dec: Declination for the source in radians.
+            merger_time: Time of merger in seconds.
+            ref_freq: Reference frequency in Hz. If `None`, it will default to `self.ref_freq`, then to the starting frequency.
+            start_freq: Starting frequency in Hz. If `None`, it will default to `self.start_freq`.
+
+        Returns:
+            t_arr, h_plus, h_cross
+
+        """
+
+        times, mask, hplus, hcross = self.compute_polarizations_at_once(
+            m1, m2, s1z, s2z, distance, phi_ref, inclination, psi,
+            start_freq=start_freq,
+            ref_freq=ref_freq,
+        )
+
+        return (
+            times[mask[0]],
+            hplus[0][mask[0]],
+            hcross[0][mask[0]],
+        )
+
+    def wave_gen_batch(
+        self,
+        m1: NDArrayLike,
+        m2: NDArrayLike,
+        s1z: NDArrayLike,
+        s2z: NDArrayLike,
+        distance: NDArrayLike,
+        phi_ref: NDArrayLike,
+        inclination: NDArrayLike,
+        psi: NDArrayLike,
+        ra: NDArrayLike = None,
+        dec: NDArrayLike = None,
+        merger_time: NDArrayLike = None,
+        ref_freq: float | NDArrayLike = None,
+        start_freq: float | NDArrayLike = None,
+        **kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Generate polarizations for a batch of sources using pyseobnr_x's batched path.
+
+        Args:
+            m1: Source-1 masses in solar masses, shape (Nbatch,).
+            m2: Source-2 masses in solar masses, shape (Nbatch,).
+            s1z: Dimensionless spin of source 1, shape (Nbatch,).
+            s2z: Dimensionless spin of source 2, shape (Nbatch,).
+            distance: Luminosity distance in Mpc, shape (Nbatch,).
+            phi_ref: Reference phase in radians, shape (Nbatch,).
+            inclination: Inclination angle in radians, shape (Nbatch,).
+            psi: Polarisation angle in radians, shape (Nbatch,).
+            ra: Right ascension in radians, shape (Nbatch,).
+            dec: Declination in radians, shape (Nbatch,).
+            merger_time: Time of merger in seconds, shape (Nbatch,).
+            ref_freq: Reference frequency in Hz, float or shape (Nbatch,).
+            start_freq: Starting frequency in Hz, float or shape (Nbatch,).
+            **kwargs: ``f_ref`` / ``f_min`` are accepted as aliases of ``ref_freq`` / ``start_freq``
+                (phentax naming); anything else is ignored.
+
+        Returns:
+            Tuple of (times_batch, h_plus_batch, h_cross_batch),
+            each of shape (Nbatch, N_valid_times) as plain NumPy or Cupy arrays.
+        """
+
+        ref_freq = kwargs.pop("f_ref", ref_freq)
+        start_freq = kwargs.pop("f_min", start_freq)
+
+        times, mask, hplus, hcross = self.compute_polarizations_at_once(
+            m1, m2, s1z, s2z, distance, phi_ref, inclination, psi,
+            start_freq=start_freq,
+            ref_freq=ref_freq,
+        )
+        times = self.xp.broadcast_to(times, mask.shape)
+
+        times_out = self.trim_and_shift_times(times, mask, xp=self.xp, dt=self.dt)
+        num_keep = times_out.shape[-1]
+
+        num_pad = num_keep - mask.sum(axis=1).astype(int)  # (Nbatch,)
+        taper_length = int(self.tdi_buffer_time * 5 / self.dt)
+        ramp = self._leading_onset_ramp(num_points=num_keep, num_pad=num_pad, taper_length=taper_length, xp=self.xp)  # (Nbatch, num_keep)
+
+        return (
+            times_out,
+            hplus[:, -num_keep:] * ramp,  # apply ramp to h_plus to avoid sharp jump at the beginning of the waveform, which can cause issues with the TDI response
+            hcross[:, -num_keep:] * ramp,  # apply ramp to h_cross to avoid sharp jump at the beginning of the waveform, which can cause issues with the TDI response
+        )
