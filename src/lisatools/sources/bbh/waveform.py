@@ -812,39 +812,61 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
         k_lo = int(np.ceil(t_lo.min() / self.dt))
         k_hi = int(np.floor(t_hi.max() / self.dt))
         times = np.arange(k_lo, k_hi + 1) * self.dt
+        num_t = times.shape[0]
+
+        # the valid samples of each source are a contiguous run [first, last] of the grid
+        def valid(i, k):
+            t = times[np.clip(k, 0, num_t - 1)]
+            t_geo = t / mtot_sec[i]
+            in_grid = (k >= 0) & (k < num_t)
+            return in_grid & (t >= t_lo[i]) & (t <= t_hi[i]) & (t_geo >= t_lo_geo[i]) & (t_geo <= t_hi_geo[i])
+
+        src = np.arange(num_bin)
+        first = np.searchsorted(times, np.maximum(t_lo, t_lo_geo * mtot_sec), side="left")
+        last = np.searchsorted(times, np.minimum(t_hi, t_hi_geo * mtot_sec), side="right") - 1
+        # the bounds above can be off by a sample through rounding: move them onto the exact selection
+        while np.any(move := (first <= last) & ~valid(src, first)):
+            first += move
+        while np.any(move := valid(src, first - 1)):
+            first -= move
+        while np.any(move := (last >= first) & ~valid(src, last)):
+            last -= move
+        while np.any(move := valid(src, last + 1)):
+            last += move
+
+        counts = np.maximum(last - first + 1, 0)
+        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
 
         # per-source geometric time samples, retrieved in one kernel call
-        sel = (times[None, :] >= t_lo[:, None]) & (times[None, :] <= t_hi[:, None])
-        times_geo = times[None, :] / mtot_sec[:, None]
-        sel &= (times_geo >= t_lo_geo[:, None]) & (times_geo <= t_hi_geo[:, None])
-
-        counts = sel.sum(axis=1)
-        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+        times_geo = np.concatenate([times[a : a + c] / m for a, c, m in zip(first, counts, mtot_sec)])
         rows = model.polarizations.evaluate(
-            self._RaggedBatch(values=np.ascontiguousarray(times_geo[sel]), offsets=offsets),
+            self._RaggedBatch(values=times_geo, offsets=offsets),
             np.arange(num_bin, dtype=np.intp),
             time_shift=t_shift,
         )
 
+        # only the valid samples go to the device; the dense arrays are filled there
+        xp = self.xp
+        sample = xp.arange(int(offsets[-1]))
+        src_of = xp.searchsorted(xp.asarray(offsets[1:]), sample, side="right")
+        col_of = sample - xp.asarray(offsets)[src_of] + xp.asarray(first)[src_of]
+
         # h+ - i hx, with the distance and LAL sign convention of GenerateWaveform
-        fac = -mtot * self._seob.lal.MRSUN_SI / (dist * self._seob.Mpc_to_meters)
-        hpc = np.zeros(sel.shape, dtype=np.complex128)
-        hpc[sel] = rows * np.repeat(fac, counts)
+        fac = xp.asarray(-mtot * self._seob.lal.MRSUN_SI / (dist * self._seob.Mpc_to_meters))
+        hpc = xp.zeros((num_bin, num_t), dtype=xp.complex128)
+        hpc[src_of, col_of] = xp.asarray(rows) * fac[src_of]
 
         # rotate by the polarization angle, as phentax does
-        cos_2psi = np.cos(2.0 * psi)[:, None]
-        sin_2psi = np.sin(2.0 * psi)[:, None]
+        cos_2psi = xp.asarray(np.cos(2.0 * psi))[:, None]
+        sin_2psi = xp.asarray(np.sin(2.0 * psi))[:, None]
         hplus = hpc.real * cos_2psi + hpc.imag * sin_2psi
         hcross = hpc.real * sin_2psi - hpc.imag * cos_2psi
 
-        mask = times[None, :] >= times[sel.argmax(axis=1)][:, None]
+        # a source without valid samples keeps the whole grid, as argmax of an empty selection did
+        start = xp.asarray(np.where(counts > 0, first, 0))
+        mask = xp.arange(num_t)[None, :] >= start[:, None]
 
-        return (
-            self.xp.asarray(times),
-            self.xp.asarray(mask),
-            self.xp.asarray(hplus),
-            self.xp.asarray(hcross),
-        )
+        return xp.asarray(times), mask, hplus, hcross
 
 
 class SEOBNRTDIWaveform(TDPyResponseWaveformBase, SEOBNRWaveformBase):
