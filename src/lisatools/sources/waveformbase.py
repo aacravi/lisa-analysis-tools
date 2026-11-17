@@ -725,9 +725,6 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         left_edges, padded = self.build_common_grid(times, channels)
         return self.transform_to_domain(left_edges, padded)
 
-<<<<<<< HEAD
-    def get_signals_for_residuals(self, *args, output_domain: str | None = None, domain_kwargs: dict | None = None, **kwargs) -> DomainBaseArray:
-=======
     def _source_chunks(self, args: tuple, kwargs: dict) -> list | None:
         """Split a batched call into chunks of at most ``self.source_batch_size`` sources.
 
