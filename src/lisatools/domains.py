@@ -1878,15 +1878,17 @@ def get_stft_settings(
 
     t0 = float(times[0])
     N = len(times)
-    dt = float(times[1] - times[0])
+    # times[1] - times[0] at t ~ 1e8 s carries ~1e-8 s rounding error, which made
+    # int(big_dt / dt) drop a sample (86400 -> 86395 s); use the full span and round.
+    dt = float(times[-1] - times[0]) / (N - 1)
 
-    big_dt = int(big_dt / dt) * dt  # make sure big_dt is an integer multiple of dt
+    nperseg = int(round(big_dt / dt))
+    big_dt = nperseg * dt  # make sure big_dt is an integer multiple of dt
     # now make sure that Tobs is an integer multiple of big_dt
 
     # NT = int(np.ceil(N / (big_dt / dt))) # number of segments
-    NT = int(np.floor(N / (big_dt / dt))) # number of segments
+    NT = N // nperseg  # number of segments
     DF = 1 / big_dt
-    nperseg = int(big_dt / dt)
     NF = nperseg // 2 + 1
 
     return STFTSettings(

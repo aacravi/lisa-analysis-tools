@@ -135,6 +135,7 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         fft_batch_size: int = 1,
         output_domain_settings: DomainSettingsBase = None,
         force_backend: str = "cpu",
+        source_batch_size: int = None,
     ) -> None:
 
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
@@ -193,6 +194,8 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         self.freq_min = freq_min
         self.freq_max = freq_max
         self.fft_batch_size = fft_batch_size
+        # max number of sources generated at once; long waveforms do not fit on the device in one batch
+        self.source_batch_size = source_batch_size
 
     @property
     def wrapper_kwargs(self) -> dict:
@@ -211,6 +214,7 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
             "fft_batch_size": self.fft_batch_size,
             "output_domain_settings": self.output_domain_settings,
             "force_backend": self.force_backend,
+            "source_batch_size": self.source_batch_size,
         }
 
 
@@ -704,11 +708,51 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         arguments or as the last N positional arguments; ``compute_tdi_channels``
         on each subclass is responsible for peeling them off ``*args``.
         """
+        chunks = self._source_chunks(args, kwargs)
+        if chunks is not None:
+            outs = [self(*a, **kw) for a, kw in chunks]
+            signal = outs[0][0]
+            if any(o[0].shape[1:] != signal.shape[1:] for o in outs) and self.nperseg is None:
+                raise ValueError("source_batch_size: FD chunks ended up on different frequency grids.")
+            # STFT chunks may differ in number of segments; the extra segments are zero, as in an unchunked call
+            shape = tuple(max(o[0].shape[d] for o in outs) for d in range(1, signal.ndim))
+            signal = self.xp.concatenate(
+                [self.xp.pad(o[0], [(0, 0)] + [(0, n - s) for n, s in zip(shape, o[0].shape[1:])]) for o in outs]
+            )
+            return (signal, *(self.xp.concatenate([o[i] for o in outs]) for i in range(1, len(outs[0]))))
+
         times, channels = self.compute_tdi_channels(*args, **kwargs)
         left_edges, padded = self.build_common_grid(times, channels)
         return self.transform_to_domain(left_edges, padded)
 
+<<<<<<< HEAD
     def get_signals_for_residuals(self, *args, output_domain: str | None = None, domain_kwargs: dict | None = None, **kwargs) -> DomainBaseArray:
+=======
+    def _source_chunks(self, args: tuple, kwargs: dict) -> list | None:
+        """Split a batched call into chunks of at most ``self.source_batch_size`` sources.
+
+        Every argument with a leading dimension equal to the number of sources is sliced; the others
+        (scalars, e.g. ``ref_freq``) are passed unchanged.
+
+        Returns:
+            List of ``(args, kwargs)`` per chunk, or `None` if the call does not need to be split.
+        """
+        ra = kwargs["ra"] if kwargs.get("ra") is not None else (args[-3] if len(args) >= 3 else None)
+        if self.source_batch_size is None or np.ndim(ra) < 1 or len(ra) <= self.source_batch_size:
+            return None
+
+        num_bin = len(ra)
+        cut = lambda x, sl: x[sl] if np.ndim(x) >= 1 and len(x) == num_bin else x
+        return [
+            (
+                tuple(cut(a, slice(i, i + self.source_batch_size)) for a in args),
+                {k: cut(v, slice(i, i + self.source_batch_size)) for k, v in kwargs.items()},
+            )
+            for i in range(0, num_bin, self.source_batch_size)
+        ]
+
+    def get_signals_for_residuals(self, *args, **kwargs) -> DomainBaseArray:
+>>>>>>> 04aec715 (added new options)
         """Generate per-source domain-wrapped signals for residual operations.
 
         Sky/response parameters may be supplied either as explicit keyword
@@ -725,6 +769,12 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
             :class:`DomainBaseArray` of per-source signals, or a single domain
             signal when ``times`` is 1-D (single-source path).
         """
+        chunks = self._source_chunks(args, kwargs)
+        if chunks is not None:
+            return DomainBaseArray(
+                [sig for a, kw in chunks for sig in self.get_signals_for_residuals(*a, **kw).signals]
+            )
+
         times, channels = self.compute_tdi_channels(*args, **kwargs)
         if times.ndim == 2:
             return DomainBaseArray([
@@ -816,6 +866,7 @@ class TDPyResponseWaveformBase(TDWaveformBase):
         run_async: bool = False,
         output_domain_settings: DomainSettingsBase = None,
         force_backend: str = "cpu",
+        source_batch_size: int = None,
     ) -> None:
 
         super().__init__(
@@ -832,6 +883,7 @@ class TDPyResponseWaveformBase(TDWaveformBase):
             fft_batch_size=fft_batch_size,
             output_domain_settings=output_domain_settings,
             force_backend=force_backend,
+            source_batch_size=source_batch_size,
         )
 
         if signal_duration is None:
@@ -1076,6 +1128,8 @@ class TDPyResponseWaveformBase(TDWaveformBase):
             tdis = tdis[None, :, :]
         else:
             tdis = tdis.transpose(1, 0, 2)
+        elif not single_source:
+            tdis = tdis[None]  # a batch of one source comes back without its batch axis
 
         tdis = tdis[..., :-num_buffer_ponts]  # remove the right-padded points
         shifted_t_arr = shifted_t_arr[:, :-num_buffer_ponts]
@@ -1236,6 +1290,7 @@ class TDTDIOnFlyWaveformBase(TDWaveformBase):
         zero_inclination: bool = False,
         output_domain_settings: DomainSettingsBase = None,
         force_backend: str = "cpu",
+        source_batch_size: int = None,
     ) -> None:
 
         if tdi_channels != "XYZ":
@@ -1257,6 +1312,7 @@ class TDTDIOnFlyWaveformBase(TDWaveformBase):
             fft_batch_size=fft_batch_size,
             output_domain_settings=output_domain_settings,
             force_backend=force_backend,
+            source_batch_size=source_batch_size,
         )
 
         self.zero_inclination = zero_inclination
