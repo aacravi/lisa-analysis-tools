@@ -748,7 +748,7 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
             for i in range(0, num_bin, self.source_batch_size)
         ]
 
-    def get_signals_for_residuals(self, *args, **kwargs) -> DomainBaseArray:
+    def get_signals_for_residuals(self, *args, output_domain: str | None = None, domain_kwargs: dict | None = None, **kwargs) -> DomainBaseArray:
         """Generate per-source domain-wrapped signals for residual operations.
 
         Sky/response parameters may be supplied either as explicit keyword
@@ -768,7 +768,13 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         chunks = self._source_chunks(args, kwargs)
         if chunks is not None:
             return DomainBaseArray(
-                [sig for a, kw in chunks for sig in self.get_signals_for_residuals(*a, **kw).signals]
+                [
+                    sig
+                    for a, kw in chunks
+                    for sig in self.get_signals_for_residuals(
+                        *a, output_domain=output_domain, domain_kwargs=domain_kwargs, **kw
+                    ).signals
+                ]
             )
 
         times, channels = self.compute_tdi_channels(*args, **kwargs)
