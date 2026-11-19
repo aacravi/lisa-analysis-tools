@@ -662,15 +662,13 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
             (``context="LISA"`` plus the CPU or GPU switches, chosen from ``force_backend``).
         Tobs: Maximum length of the waveform in seconds. Longer waveforms are cut at the start.
         start_freq: Starting frequency of the (2,2) mode in Hz. If `None`, it has to be explicitly provided in the waveform generation calls.
-        ref_freq: Reference frequency in Hz. If `None`, it defaults to the starting frequency.
+        ref_freq: Reference frequency in Hz, without ``use_reference_time``. If `None`, it defaults to the starting
+            frequency derived from ``Tobs`` (see :meth:`get_reference_quantities`), not to ``start_freq``.
         use_reference_time: If `True`, reference the phase at ``waveform_t0`` (phentax's ``t_ref = -merger_time``).
+            A merger more than ``TOBS_MARGIN * Tobs`` after ``waveform_t0`` then makes ``pyseobnr_x`` integrate back
+            to ``waveform_t0``, which can cost months of extra inspiral. Set it to `False` to integrate only the kept
+            ``Tobs`` (``phi_ref`` is then the phase at ``ref_freq``, by default the start of the waveform).
         use_coalescence_time: Not supported together with ``use_reference_time``.
-        ref_not_before_start: With ``use_reference_time``, never let the reference frequency fall below the
-            starting frequency. If `True` (default), a merger more than ``TOBS_MARGIN * Tobs`` after ``waveform_t0``
-            moves the reference up to the starting frequency, so only the kept ``Tobs`` is integrated (``phi_ref`` is
-            then the phase at the start of the waveform). If `False`, ``pyseobnr_x`` integrates back to
-            ``waveform_t0`` in that case (``phi_ref`` is the phase at ``waveform_t0``, as in phentax), which can cost
-            months of extra inspiral.
     """
 
     CPU_SWITCHES = dict(
@@ -698,7 +696,6 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
         ref_freq: float = None,
         use_reference_time: bool = True,
         use_coalescence_time: bool = False,
-        ref_not_before_start: bool = True,
     ) -> None:
 
         if not pyseobnr_available:
@@ -724,7 +721,6 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
                 "use_coalescence_time: pyseobnr_x can only reference the phase at an inspiral frequency, not at the peak."
             )
         self.use_reference_time = use_reference_time
-        self.ref_not_before_start = ref_not_before_start
         self.ref_time = np.asarray(0.0) if use_coalescence_time else None
 
         # host buffers reused across calls: a fresh multi-GB allocation per call costs seconds in page faults
@@ -755,7 +751,7 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
         * the starting frequency is the one at ``TOBS_MARGIN * Tobs`` before merger, never below ``start_freq``;
         * with ``use_reference_time``, the reference frequency is the one at ``merger_time`` before merger,
           i.e. at ``waveform_t0`` as phentax's ``t_ref = -merger_time``; otherwise it is ``ref_freq``
-          (default ``start_freq``).
+          (default: the starting frequency above, so only the kept ``Tobs`` is integrated).
 
         Both are capped at the (2,2) frequency of r = 10.5 M: pyseobnr_x moves a later start there, and
         refuses a reference past the end of the inspiral.
@@ -765,7 +761,7 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
             m2: Source-2 masses in solar masses, shape (Nbatch,).
             merger_time: Merger time in seconds relative to ``waveform_t0``, shape (Nbatch,). Needed with ``use_reference_time``.
             start_freq: Lowest starting frequency in Hz. If `None`, it will default to `self.start_freq`.
-            ref_freq: Reference frequency in Hz, without ``use_reference_time``. If `None`, it will default to `self.ref_freq`, then to `start_freq`.
+            ref_freq: Reference frequency in Hz, without ``use_reference_time``. If `None`, it will default to `self.ref_freq`, then to the ``Tobs``-derived starting frequency.
 
         Returns:
             ``{"start_freq": ..., "ref_freq": ...}`` in Hz, shape (Nbatch,), for :meth:`compute_polarizations_at_once`.
@@ -791,12 +787,10 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
             # phentax's t_ref = -merger_time: the reference is at waveform_t0, merger_time before the peak
             tau = to_host(merger_time)
             f_ref = np.where(tau > 0.0, self._f22_before_merger(m1, m2, np.where(tau > 0.0, tau, 1.0)), f_cap)
-            if self.ref_not_before_start:
-                # waveform_t0 earlier than the kept Tobs: reference at the start instead of integrating back to it
-                f_ref = np.maximum(f_ref, f_start)
             f_ref = np.minimum(f_ref, f_cap)
         else:
-            f_ref = to_host(ref_freq) if ref_freq is not None else start_freq
+            # default to the Tobs-driven start, not the start_freq floor: the floor would integrate far beyond Tobs
+            f_ref = to_host(ref_freq) if ref_freq is not None else f_start
 
         # pyseobnr_x would lower the start to a reference below it anyway
         return {"start_freq": np.minimum(f_start, f_ref), "ref_freq": f_ref}
@@ -820,7 +814,6 @@ class SEOBNRWaveformBase(BBHTDWaveformMixin):
             "ref_freq": self.ref_freq,
             "use_reference_time": self.use_reference_time,
             "use_coalescence_time": self.ref_time is not None,
-            "ref_not_before_start": self.ref_not_before_start,
         }
 
     def compute_polarizations_at_once(
@@ -985,10 +978,9 @@ class SEOBNRTDIWaveform(TDPyResponseWaveformBase, SEOBNRWaveformBase):
         waveform_kwargs: Computation parameters forwarded to :class:`pyseobnr_x.generate_waveform.GenerateWaveform`.
         Tobs: Maximum length of the waveform in seconds.
         start_freq: Starting frequency in Hz for the waveform generation. If `None`, it has to be explicitly provided in the waveform generation calls.
-        ref_freq: Reference frequency in Hz for the waveform generation. If `None`, it defaults to the starting frequency.
+        ref_freq: See :class:`SEOBNRWaveformBase`.
         use_reference_time: See :class:`SEOBNRWaveformBase`.
         use_coalescence_time: See :class:`SEOBNRWaveformBase`.
-        ref_not_before_start: See :class:`SEOBNRWaveformBase`.
         *args: Additional positional arguments forwarded to :class:`TDPyResponseWaveformBase`.
         **kwargs: Additional keyword arguments forwarded to :class:`TDPyResponseWaveformBase`.
     """
@@ -1001,7 +993,6 @@ class SEOBNRTDIWaveform(TDPyResponseWaveformBase, SEOBNRWaveformBase):
         ref_freq: float = None,
         use_reference_time: bool = True,
         use_coalescence_time: bool = False,
-        ref_not_before_start: bool = True,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -1020,7 +1011,6 @@ class SEOBNRTDIWaveform(TDPyResponseWaveformBase, SEOBNRWaveformBase):
             ref_freq=ref_freq,
             use_reference_time=use_reference_time,
             use_coalescence_time=use_coalescence_time,
-            ref_not_before_start=ref_not_before_start,
         )
 
     @property
