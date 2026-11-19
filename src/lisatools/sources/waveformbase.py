@@ -749,7 +749,6 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         ]
 
     def get_signals_for_residuals(self, *args, **kwargs) -> DomainBaseArray:
->>>>>>> 04aec715 (added new options)
         """Generate per-source domain-wrapped signals for residual operations.
 
         Sky/response parameters may be supplied either as explicit keyword
@@ -1125,8 +1124,6 @@ class TDPyResponseWaveformBase(TDWaveformBase):
             tdis = tdis[None, :, :]
         else:
             tdis = tdis.transpose(1, 0, 2)
-        elif not single_source:
-            tdis = tdis[None]  # a batch of one source comes back without its batch axis
 
         tdis = tdis[..., :-num_buffer_ponts]  # remove the right-padded points
         shifted_t_arr = shifted_t_arr[:, :-num_buffer_ponts]
